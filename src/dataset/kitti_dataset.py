@@ -4,26 +4,34 @@ from pathlib import Path
 
 import numpy as np
 
+from src.geometry.boxes import get_lidar_boxes
 from src.preprocessing.bev import bev_projection
+from src.targets.bev_targets import create_bev_targets
 
 
 class KittiDataset:
+    """Load aligned LiDAR, calibration, and optional label files."""
+
+    VALID_SPLITS = {"training", "testing"}
+
     def __init__(self, root, split="training"):
         self.root = Path(root)
-        self.split = split
-        if split not in {"training", "testing"}:
+        if split not in self.VALID_SPLITS:
             raise ValueError("split must be 'training' or 'testing'")
+        self.split = split
 
-        self.velodyne_dir = self.root / split / "velodyne"
-        self.label_dir = self.root / split / "label_2"
-        self.calib_dir = self.root / split / "calib"
+        split_dir = self.root / split
+        self.velodyne_dir = split_dir / "velodyne"
+        self.label_dir = split_dir / "label_2"
+        self.calib_dir = split_dir / "calib"
+
         if not self.velodyne_dir.is_dir():
             raise FileNotFoundError(f"LiDAR directory not found: {self.velodyne_dir}")
         if not self.calib_dir.is_dir():
             raise FileNotFoundError(f"calibration directory not found: {self.calib_dir}")
 
-        self.sample_ids = sorted(p.stem for p in self.velodyne_dir.glob("*.bin"))
         self.has_labels = self.label_dir.is_dir()
+        self.sample_ids = sorted(path.stem for path in self.velodyne_dir.glob("*.bin"))
 
     def __len__(self):
         return len(self.sample_ids)
@@ -44,24 +52,26 @@ class KittiDataset:
             raise ValueError(f"invalid LiDAR file (float count is not divisible by 4): {path}")
         return raw.reshape(-1, 4)
 
-    def bev_projection(self, points):
-        """Backward-compatible access to the canonical BEV implementation."""
-        return bev_projection(points)
-
     def load_calibration(self, sample_id):
         path = self.calib_dir / f"{sample_id}.txt"
         values = {}
-        with open(path) as file:
-            for line in file:
-                if not line.strip():
+        with path.open(encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
+                line = line.strip()
+                if not line:
                     continue
-                key, raw_values = line.strip().split(":", maxsplit=1)
+                if ":" not in line:
+                    raise ValueError(f"invalid calibration line {line_number} in {path}")
+                key, raw_values = line.split(":", maxsplit=1)
                 values[key] = np.fromstring(raw_values, sep=" ", dtype=np.float32)
 
-        required = {"P2", "R0_rect", "Tr_velo_to_cam"}
-        missing = required.difference(values)
-        if missing:
-            raise ValueError(f"missing calibration keys {sorted(missing)} in {path}")
+        expected = {"P2": 12, "R0_rect": 9, "Tr_velo_to_cam": 12}
+        for key, count in expected.items():
+            if key not in values:
+                raise ValueError(f"missing calibration key {key!r} in {path}")
+            if values[key].size != count or not np.isfinite(values[key]).all():
+                raise ValueError(f"invalid calibration value {key!r} in {path}")
+
         return {
             "p2": values["P2"].reshape(3, 4),
             "r0_rect": values["R0_rect"].reshape(3, 3),
@@ -71,21 +81,42 @@ class KittiDataset:
     def load_labels(self, sample_id):
         if not self.has_labels:
             return []
+
         path = self.label_dir / f"{sample_id}.txt"
         objects = []
-        with open(path) as file:
-            for line in file:
+        with path.open(encoding="utf-8") as file:
+            for line_number, line in enumerate(file, start=1):
                 fields = line.split()
+                if not fields:
+                    continue
                 if len(fields) != 15:
-                    raise ValueError(f"expected 15 label fields in {path}, got {len(fields)}")
-                objects.append({
-                    "type": fields[0],
-                    "truncated": float(fields[1]),
-                    "occluded": int(fields[2]),
-                    "alpha": float(fields[3]),
-                    "bbox": np.asarray(fields[4:8], dtype=np.float32),
-                    "dimensions": np.asarray(fields[8:11], dtype=np.float32),
-                    "location": np.asarray(fields[11:14], dtype=np.float32),
-                    "rotation_y": float(fields[14]),
-                })
+                    raise ValueError(
+                        f"expected 15 label fields on line {line_number} in {path}, "
+                        f"got {len(fields)}"
+                    )
+                try:
+                    obj = {
+                        "type": fields[0],
+                        "truncated": float(fields[1]),
+                        "occluded": int(fields[2]),
+                        "alpha": float(fields[3]),
+                        "bbox": np.asarray(fields[4:8], dtype=np.float32),
+                        "dimensions": np.asarray(fields[8:11], dtype=np.float32),
+                        "location": np.asarray(fields[11:14], dtype=np.float32),
+                        "rotation_y": float(fields[14]),
+                    }
+                except ValueError as exc:
+                    raise ValueError(f"invalid label values on line {line_number} in {path}") from exc
+                numeric = np.concatenate((obj["bbox"], obj["dimensions"], obj["location"]))
+                if not np.isfinite(numeric).all() or not np.isfinite(obj["rotation_y"]):
+                    raise ValueError(f"non-finite label values on line {line_number} in {path}")
+                objects.append(obj)
         return objects
+
+    def get_training_sample(self, idx):
+        if not self.has_labels:
+            raise ValueError(f"split {self.split!r} has no labels for training targets")
+        sample = self[idx]
+        bev = bev_projection(sample["points"])
+        boxes = get_lidar_boxes(sample["labels"], sample["calib"])
+        return bev, create_bev_targets(boxes)
