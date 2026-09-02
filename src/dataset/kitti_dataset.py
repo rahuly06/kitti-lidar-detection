@@ -1,9 +1,8 @@
 """Dataset access for the KITTI object-detection benchmark."""
 
 from pathlib import Path
-
+import cv2
 import numpy as np
-
 from src.geometry.boxes import get_lidar_boxes
 from src.preprocessing.bev import bev_projection
 from src.targets.bev_targets import create_bev_targets
@@ -14,21 +13,25 @@ class KittiDataset:
 
     VALID_SPLITS = {"training", "testing"}
 
-    def __init__(self, root, split="training"):
+    def __init__(self, root, split="training", load_images=False):
         self.root = Path(root)
         if split not in self.VALID_SPLITS:
             raise ValueError("split must be 'training' or 'testing'")
         self.split = split
+        self.load_images = load_images
 
         split_dir = self.root / split
         self.velodyne_dir = split_dir / "velodyne"
         self.label_dir = split_dir / "label_2"
         self.calib_dir = split_dir / "calib"
+        self.image_dir = split_dir / "image_2"
 
         if not self.velodyne_dir.is_dir():
             raise FileNotFoundError(f"LiDAR directory not found: {self.velodyne_dir}")
         if not self.calib_dir.is_dir():
             raise FileNotFoundError(f"calibration directory not found: {self.calib_dir}")
+        if self.load_images and not self.image_dir.is_dir():
+            raise FileNotFoundError(f"Image directory not found: {self.image_dir}")
 
         self.has_labels = self.label_dir.is_dir()
         self.sample_ids = sorted(path.stem for path in self.velodyne_dir.glob("*.bin"))
@@ -43,7 +46,21 @@ class KittiDataset:
             "points": self.load_velodyne(sample_id),
             "calib": self.load_calibration(sample_id),
             "labels": self.load_labels(sample_id) if self.has_labels else [],
+            "image": self.load_image(sample_id)
         }
+
+    def load_image(self, sample_id):
+        if not self.load_images:
+            return None
+        
+        path = self.image_dir / f"{sample_id}.png"
+        image = cv2.imread(path)
+
+        if image is None:
+            raise ValueError(f"Failed to decode camera image: {path}")
+
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return rgb_image
 
     def load_velodyne(self, sample_id):
         path = self.velodyne_dir / f"{sample_id}.bin"
@@ -112,6 +129,7 @@ class KittiDataset:
                     raise ValueError(f"non-finite label values on line {line_number} in {path}")
                 objects.append(obj)
         return objects
+
 
     def get_training_sample(self, idx):
         if not self.has_labels:
