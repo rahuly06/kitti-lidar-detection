@@ -17,6 +17,7 @@ from src.inference.decode import decode_predictions
 from src.losses.detection_loss import DetectionLoss
 from src.models.bev_detector import BEVDetector
 from src.preprocessing.bev import bev_projection
+from src.preprocessing.fusion import build_fused_bev
 from src.targets.bev_targets import create_bev_targets
 
 
@@ -45,13 +46,25 @@ def resolve_device(requested):
 class DetectionView(Dataset):
     """Create BEV tensors and targets for a fixed set of KITTI indices."""
 
-    def __init__(self, dataset, indices, augment=False, flip_probability=0.5):
+    def __init__(
+        self,
+        dataset,
+        indices,
+        augment=False,
+        flip_probability=0.5,
+        input_mode="lidar",
+    ):
         if not 0 <= flip_probability <= 1:
             raise ValueError("flip_probability must lie in [0, 1]")
+        if input_mode not in {"lidar", "fusion"}:
+            raise ValueError("input_mode must be 'lidar' or 'fusion'")
+        if input_mode == "fusion" and not dataset.load_images:
+            raise ValueError("fusion input requires a dataset with load_images=True")
         self.dataset = dataset
         self.indices = list(indices)
         self.augment = augment
         self.flip_probability = flip_probability
+        self.input_mode = input_mode
 
     def __len__(self):
         return len(self.indices)
@@ -61,11 +74,20 @@ class DetectionView(Dataset):
         points = sample["points"]
         boxes = get_lidar_boxes(sample["labels"], sample["calib"])
 
-        # Reflection around the LiDAR x axis is physically valid for a road
-        # scene. Recomputing BEV and targets avoids fractional-offset mistakes.
-        if self.augment and torch.rand(()).item() < self.flip_probability:
-            points = points.copy()
-            points[:, 1] *= -1
+        flip = self.augment and torch.rand(()).item() < self.flip_probability
+        if self.input_mode == "fusion":
+            bev = build_fused_bev(points, sample["image"], sample["calib"])
+            if flip:
+                # The second spatial dimension is lateral. Flip every channel
+                # together so LiDAR, RGB, and visibility remain aligned.
+                bev = np.flip(bev, axis=2).copy()
+        else:
+            if flip:
+                points = points.copy()
+                points[:, 1] *= -1
+            bev = bev_projection(points)
+
+        if flip:
             boxes = [
                 {
                     **box,
@@ -75,7 +97,7 @@ class DetectionView(Dataset):
                 for box in boxes
             ]
 
-        return bev_projection(points), create_bev_targets(boxes)
+        return bev, create_bev_targets(boxes)
 
 
 def collate_detection_batch(items):
@@ -93,9 +115,14 @@ def collate_detection_batch(items):
     return inputs, batch_targets
 
 
-def create_batch(dataset, indices, device):
+def create_batch(dataset, indices, device, input_mode="lidar"):
     """Backward-compatible direct batch construction."""
-    view = DetectionView(dataset, indices, augment=False)
+    view = DetectionView(
+        dataset,
+        indices,
+        augment=False,
+        input_mode=input_mode,
+    )
     inputs, targets = collate_detection_batch([view[index] for index in range(len(view))])
     return inputs.to(device), {key: value.to(device) for key, value in targets.items()}
 
@@ -215,19 +242,35 @@ def train(
     validation_fraction=0.2,
     flip_probability=0.5,
     num_workers=0,
+    input_mode="lidar",
 ):
     if not dataset.has_labels:
         raise ValueError("training requires a dataset with labels")
     if epochs <= 0 or batch_size <= 0 or learning_rate <= 0 or num_workers < 0:
         raise ValueError("epochs, batch_size, learning_rate must be positive and num_workers non-negative")
+    if input_mode not in {"lidar", "fusion"}:
+        raise ValueError("input_mode must be 'lidar' or 'fusion'")
+    if input_mode == "fusion" and not dataset.load_images:
+        raise ValueError("fusion training requires load_images=True")
 
     seed_everything(seed)
     device = resolve_device(device)
     train_indices, validation_indices = split_indices(
         len(dataset), subset_size, validation_fraction, seed
     )
-    train_view = DetectionView(dataset, train_indices, augment=True, flip_probability=flip_probability)
-    validation_view = DetectionView(dataset, validation_indices, augment=False)
+    train_view = DetectionView(
+        dataset,
+        train_indices,
+        augment=True,
+        flip_probability=flip_probability,
+        input_mode=input_mode,
+    )
+    validation_view = DetectionView(
+        dataset,
+        validation_indices,
+        augment=False,
+        input_mode=input_mode,
+    )
     generator = torch.Generator().manual_seed(seed)
     loader_options = {
         "batch_size": batch_size,
@@ -240,7 +283,8 @@ def train(
         DataLoader(validation_view, shuffle=False, **loader_options) if validation_indices else None
     )
 
-    model = BEVDetector().to(device)
+    input_channels = 7 if input_mode == "fusion" else 3
+    model = BEVDetector(input_channels=input_channels).to(device)
     criterion = DetectionLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -308,13 +352,24 @@ def build_parser():
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--input-mode",
+        choices=("lidar", "fusion"),
+        default="lidar",
+        help="use 3-channel LiDAR BEV or 7-channel LiDAR-camera BEV",
+    )
     parser.add_argument("--output", type=Path, default=Path("outputs/bev_detector_multiscale.pth"))
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    dataset = KittiDataset(args.data_root, split="training")
+    input_channels = 7 if args.input_mode == "fusion" else 3
+    dataset = KittiDataset(
+        args.data_root,
+        split="training",
+        load_images=args.input_mode == "fusion",
+    )
     config = {
         "data_root": str(args.data_root),
         "epochs": args.epochs,
@@ -326,6 +381,8 @@ def main(argv=None):
         "num_workers": args.num_workers,
         "device": args.device,
         "seed": args.seed,
+        "input_mode": args.input_mode,
+        "input_channels": input_channels,
         "architecture": "multiscale_encoder_decoder_v1",
     }
     model, history, actual_device, split = train(
@@ -339,6 +396,7 @@ def main(argv=None):
         validation_fraction=args.validation_fraction,
         flip_probability=args.flip_probability,
         num_workers=args.num_workers,
+        input_mode=args.input_mode,
     )
     config["resolved_device"] = str(actual_device)
     config["train_samples"] = len(split["train_indices"])

@@ -20,9 +20,14 @@ class ConvBlock(nn.Sequential):
 class BEVDetector(nn.Module):
     """Predict car centers and box parameters at the input BEV resolution."""
 
-    def __init__(self):
+    def __init__(self, input_channels=3):
         super().__init__()
-        self.stem = ConvBlock(3, 32)
+        if not isinstance(input_channels, int) or isinstance(input_channels, bool):
+            raise TypeError("input_channels must be an integer")
+        if input_channels <= 0:
+            raise ValueError("input_channels must be positive")
+        self.input_channels = input_channels
+        self.stem = ConvBlock(input_channels, 32)
         self.encoder_1 = ConvBlock(32, 64, stride=2)
         self.encoder_2 = ConvBlock(64, 128, stride=2)
         self.context = nn.Sequential(
@@ -51,8 +56,11 @@ class BEVDetector(nn.Module):
         )
 
     def forward(self, inputs):
-        if inputs.ndim != 4 or inputs.shape[1] != 3:
-            raise ValueError(f"inputs must have shape (B, 3, H, W), got {tuple(inputs.shape)}")
+        if inputs.ndim != 4 or inputs.shape[1] != self.input_channels:
+            raise ValueError(
+                f"inputs must have shape (B, {self.input_channels}, H, W), "
+                f"got {tuple(inputs.shape)}"
+            )
         stem = self.stem(inputs)
         encoded_1 = self.encoder_1(stem)
         encoded_2 = self.context(self.encoder_2(encoded_1))

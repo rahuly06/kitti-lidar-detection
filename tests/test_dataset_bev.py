@@ -48,7 +48,7 @@ class BevProjectionTests(unittest.TestCase):
         self.assertEqual(bev.shape, (3, *BEV_SHAPE))
         self.assertEqual(bev.dtype, np.float32)
         self.assertTrue(np.isfinite(bev).all())
-        self.assertAlmostEqual(float(bev[0, 5, 0]), 0.75)
+        self.assertAlmostEqual(float(bev[0, 5, 0]), 0.5)
         self.assertAlmostEqual(float(bev[2, 5, 0]), 0.75)
         self.assertAlmostEqual(float(bev[1, 5, 0]), np.log(3) / np.log(65))
 

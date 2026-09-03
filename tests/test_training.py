@@ -20,6 +20,7 @@ from src.training.training_script import (
 
 class TinyDataset:
     has_labels = True
+    load_images = False
 
     def __len__(self):
         return 1
@@ -37,6 +38,7 @@ class TinyDataset:
 
 class FlipDataset:
     has_labels = True
+    load_images = False
 
     def __len__(self):
         return 1
@@ -62,9 +64,10 @@ class FlipDataset:
 
 
 class TinyDetector(nn.Module):
-    def __init__(self):
+    def __init__(self, input_channels=3):
         super().__init__()
-        self.head = nn.Conv2d(3, 7, kernel_size=1)
+        self.input_channels = input_channels
+        self.head = nn.Conv2d(input_channels, 7, kernel_size=1)
 
     def forward(self, inputs):
         output = self.head(inputs)
@@ -78,8 +81,14 @@ class TinyDetector(nn.Module):
 
 class TrainingUtilityTests(unittest.TestCase):
     def test_parser_seed_split_and_checkpoint(self):
-        args = build_parser().parse_args(["--epochs", "1", "--subset-size", "1", "--device", "cpu"])
+        args = build_parser().parse_args(
+            [
+                "--epochs", "1", "--subset-size", "1",
+                "--device", "cpu", "--input-mode", "fusion",
+            ]
+        )
         self.assertEqual(args.epochs, 1)
+        self.assertEqual(args.input_mode, "fusion")
         seed_everything(7)
         first = torch.rand(1)
         seed_everything(7)
